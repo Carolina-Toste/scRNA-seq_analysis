@@ -1,0 +1,1058 @@
+---
+title: "Differential expression between conditions"
+---
+
+```{r}
+#| label: source packages needed
+# load packages needed
+source(here::here("scripts/setup.R"))
+```
+
+-   As each cell is not considered an independent biological replicate per-cell counts cannot be submitted to a DE analysis pipeline, therefore [psuedo-bulking](https://www.nature.com/articles/srep39921) collapses the data into by Sample for edgeR DE analysis (can also use DESeq2).
+
+-   While within-cluster heterogeneity is masked by this analysis but this highlights up- or down-regulated DEGS in a particular condition or genotype.
+
+-   Relative OSCA section [multi-sample comparisons](https://bioconductor.org/books/release/OSCA/book-contents.html#multi-sample) of the OSCA book.
+
+-   Input should be reconstructed counts or counts.
+
+-   A reminder of the sce clusters and sample contributions to each cluster:
+
+```{r}
+#| label: DE-load
+#| fig-keep: last
+#| fig-width: 8
+#| fig-height: 4
+
+# Load outcome of Clustering analysis 
+sce <- readRDS(here("results/Clustered.rds"))
+# sce_chip2 <- readRDS("Chip2/results etc")
+
+# Set cluster number as colLabel, select louvain or leiden
+colLabels(sce) <- sce$louvain
+
+# Summary of cluster contributions from each sample
+tab <- table(colLabels(sce), sce$Sample)
+
+# t-SNE plot of clustering
+p1 <- plotTSNE(sce, colour_by="louvain")+ facet_wrap(~colData(sce)$Sample)
+
+# Heatmap summarising number of cells per cluster from each sample
+p2 <- pheatmap(tab, 
+         border_color = NA,
+         drop_levels = TRUE,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE)
+
+grid.arrange(p1, p2[[4]], ncol = 2)
+
+rm(p1, p2)
+```
+
+## EdgeR
+
+-   DE analysis with [EdgeR quasi-likeliehood dispersions](https://bioconductor.org/packages/devel/workflows/vignettes/RnaSeqGeneEdgeRQL/inst/doc/edgeRQL.html), can handle biological variation between replicates in each sample group, e.g. WT vs Mutant.
+
+### Pseudo-bulk by Cluster
+
+-   Reformat data for pseudo-bulk by summing counts together for all cells with the same combination of label and sample, with `aggregateAcrossCells`.
+-   If your data is clustering nicely by sample then you can aggregate data by sample rather than by cluster (see below).
+-   View object with `summed` or `colData(summed)`
+-   Input should be reconstructed counts or counts.
+
+```{r}
+#| label: pseudo-byCluster
+# Using 'cluster label' and 'sample' as our two factors you may wish to include
+# additional columns for your data analysis, e.g. sequencing lane, batch or
+# sample group.
+columnsToUse <- c("Sample", "louvain", "Genotype", "Sex", "Age", "chip")
+colData(sce) <- colData(sce) %>% 
+  data.frame() %>% 
+  dplyr::select(all_of(columnsToUse)) %>% 
+  DataFrame()
+
+summed <- aggregateAcrossCells(sce, 
+    				id = colData(sce)[,c("louvain", "Sample")])
+```
+
+### Step-by-Step for 1 Cluster
+
+-   Not all cluster labels are used for generating this coefficient, as a strong DE between labels or batch effects would prevent a sensible model from being calculated.
+
+```{r}
+#| label: DGElist-Cluster
+labelToGet <- "1" 
+current <- summed[,labelToGet==summed$louvain]
+colData(current)
+
+# Creating a DGElist object for edgeR
+countsToUse <- counts(current)
+colnames(countsToUse) <- colData(current)$Sample
+y <- DGEList(countsToUse, samples=colData(current))
+```
+
+-   Remove samples with low library size e.g. sample contributing \< 10 cells to a cluster won't be informative.
+
+```{r}
+#| label: filt-count
+discarded <- current$ncells < 10
+y <- y[,!discarded]
+summary(discarded)
+```
+
+-   Remove genes that are lowly expressed to improve accuracy of the pseudo-bulk modeling.
+-   The `filterByExpr` function discards genes below a log-CPM threshold in a minimum number of samples (based on smallest group size)
+
+```{r}
+#| label: filt-expr
+keep <- filterByExpr(y, group = current$Sample)
+y <- y[keep,]
+summary(keep)
+```
+
+-   Correct for composition biases (e.g. caused by different sequencing depths) by calculating a [scaling factor](https://genomebiology.biomedcentral.com/articles/10.1186/gb-2010-11-3-r25) for the library size with the `calcNormFactors` function.
+
+```{r}
+#| label: calc-NormFactors
+y <- calcNormFactors(y)
+y$samples
+```
+
+-   Check the pseudo-bulk profile has been normalised using a mean-difference plot.
+    -   Should see a trumpet shape centered at zero.
+    -   If there is no zero-centering or discrete patterns at low logCPM values then indicates a normalisation issue likely caused by a lack of cells/reads in one profile.
+
+```{r}
+#| label: MD-plot
+#| fig-width: 9
+#| fig-height: 4
+par(mfrow=c(2,3))
+for(i in seq_len(ncol(y))){
+  plotMD(y, column = i)
+}
+```
+
+-   Check similarity between the transcriptomes are between the different samples with a multi-dimensional scaling plot (similar principles to a PCA plot).
+    -   Requires sample number to be **\> 2**.
+
+```{r}
+#| label: MDS-plot
+#| fig-height: 3.5
+#| fig-width: 4
+plotMDS.DGEList(y, col = as.numeric(y$samples$Sample))
+```
+
+-   Testing if the log-fold change between sample groups is significantly different from zero.
+    -   You will need to alter the design of the model matrix for **your** experimental question.
+-   Estimate the negative binomial dispersions with `estimateDisp()`
+-   Plot indicates the the biological coefficient of variation where each dot indicates a gene.
+
+- NOTE: I'm not sure why the `~0` is part of the design formula?
+
+```{r}
+#| label: NB-disp
+# Test design
+design <- model.matrix(~0 + factor(Genotype) + factor(Age) + factor(Sex), y$samples)
+design
+
+# Estimate negative binomial dispersions
+y <- estimateDisp(y, design)
+summary(y$trended.dispersion)
+
+# Plot Biological coefficient of Variation
+plotBCV(y)
+```
+
+-   A complementary measure of variance is the quasi-likelihood dispersions, estimated with the `glmQLFit` function.
+-   This model looks at the uncertainty and variability of the per-gene variance.
+
+```{r}
+#| label: QL-disp
+fit <- glmQLFit(y, design, robust = TRUE)
+summary(fit$var.prior)
+
+plotQLDisp(fit)
+```
+
+-   Test for differences in expression due to sample group, DEGs are defined as having a lfc that isn't zero at a FDR rate of 5%.
+-   A large number of non-significant DEGs suggest sample group is having little impact on the transcriptome.
+
+```{r}
+#| label: QLF-test
+res <- glmQLFTest(fit, coef = ncol(design))
+
+# Summary table of DEGs
+summary(decideTests(res))
+
+# Gene names and FDR values for the investigated cluster
+topTags(res)$table
+
+#rm(countsToUse, current, fit, res, y, columnsToUse, i, discarded, keep, labelToGet, tab)
+```
+
+### Looping across Clusters
+
+-   Using the `pseudobulkDGE` function this process will be repeated for all the other clusters.
+    -   Won't suit all experimental designs *clusters will need to consist of 2 or more sample groups*
+-   Apply a common design matrix that will be used in the analysis for each cluster/label.
+    -   Adjust the factor(s) to fit your experimental design.
+    -   Defaults the baseline as the 1st label alphabetically, can use `relevel` command to reorder factors if desired.
+-   Output will be a list of DEG for each cluster, investigate dataframes with `de.results[["x"]]`
+-   Clusters with low replicates or it only exists in one condition will be skipped, use `metadata(de.results)$failed` command to investigate.
+
+```{r}
+# convert multiple columns from sce object to factor and optionally relevel
+convert_to_factor <-
+  function(sce, cols_to_convert, ref_level = NA) {
+    # get coldata as dataframe
+    colData_df <- as.data.frame(colData(sce))
+    # convert col to factor
+    colData_df[, cols_to_convert] <-
+      lapply(colData_df[, cols_to_convert], factor)
+    # relevel factor if value provided
+    if (sum(!is.na(ref_level)) != 0) {
+      # subset columns to ones where ref levels are provided
+      cols_to_convert <- cols_to_convert[!is.na(ref_level)]
+      ref_level <- ref_level[!is.na(ref_level)]
+      colData_df[, cols_to_convert] <-
+        #lapply(colData_df[, cols_to_convert], relevel, ref = ref_level)
+        map2(colData_df[, cols_to_convert], ref_level, ~ relevel(.x, ref = .y))
+    }
+    # convert back to S4 compatible df and add back to sce object
+    colData_adf <- DataFrame(colData_df)
+    colData(sce) <- colData_adf
+    sce
+  }
+```
+
+- NOTE: the following chunks were set to `eval: false` and I've left them that way as I'm not familar with `edgeR`
+
+```{r}
+#| label: edgeR-all
+#| eval: false
+# Filter out clusters with insufficient cells (< 10).
+summed.filt <- summed[,summed$ncells >=10]
+
+cols_to_convert <- c("Genotype", "Sex", "Age", "chip")
+
+summed.filt <- convert_to_factor(summed.filt, cols_to_convert)
+
+# Apply the `pseudoBulkDGE` function to obtain a list of DE genes for each label.
+de.results <- scran::pseudoBulkDGE(summed.filt, 
+    label = summed.filt$louvain,
+    design = ~0 + Genotype + Age + Sex,
+    coef = "GenotypeAPP",
+    condition = summed.filt$Fixative
+)
+```
+
+-   Examine the DEGs at a FDR of 5% for each cluster/label using the `decideTestsPerLabel` function.
+    -   NA indicates low expression or comparison wasn't possible.
+    -   Down-regulated genes are in the *-1* column, up-regulated in *+1* and *0* indicates no significant changes.
+
+```{r}
+#| label: Cross-Cluster Summary
+#| eval: false
+is.de <- decideTestsPerLabel(de.results, threshold=0.05)
+summarizeTestsPerLabel(is.de)
+```
+
+-   You can then determine the proportion of clusters/cell-types in which the DEGs are present for both up- and down-regulated genes.
+    -   If you would prefer to view the data as volcano plots you can use the code from the DESeq2 analysis.
+
+```{r}
+#| label: Universal-DEGs
+#| eval: false
+# Upregulated across most cell types.
+up.de <- is.de > 0 & !is.na(is.de)
+head(sort(rowMeans(up.de), decreasing=TRUE), 10)
+
+# Downregulated across cell types.
+down.de <- is.de < 0 & !is.na(is.de)
+head(sort(rowMeans(down.de), decreasing=TRUE), 10)
+```
+
+-   A list of cluster/label-specific DEGs:
+
+```{r}
+#| label: Specific_DEGs
+#| eval: false
+# First generate an extremely "unlikely" DEG the FDR is relaxed to 50%, i.e. If it isn't significant at a 50% false-positive rate then is not considered DE expressed.
+remotely.de <- decideTestsPerLabel(de.results, threshold=0.5)
+not.de <- remotely.de==0 | is.na(remotely.de)
+
+# Subset the data to investigate one cluster of interest
+cx <- colnames(is.de)[4]
+
+# List the other clusters in the dataset
+other.labels <- setdiff(colnames(not.de), cx)
+
+# Select DEGs that are DE in cluster of interest only.
+unique.degs <- is.de[,cx]!=0 & rowMeans(not.de[,other.labels]==1)
+unique.degs <- names(which(unique.degs))
+head(unique.degs)
+```
+
+-   A Plot of the most DEG unique to cluster set as `cx` export desired results as csv files (can copy code from above)
+
+```{r}
+#| label: plot-DEGs
+#| eval: false
+# Plotting expression levels
+de.inspec <- list()
+de.inspec[[cx]] <- de.results[[cx]]
+de.inspec[[cx]] <- de.inspec[[cx]][order(de.inspec[[cx]]$PValue),]
+de.inspec[[cx]] <- de.inspec[[cx]][rownames(de.inspec[[cx]]) %in% unique.degs,]
+
+sizeFactors(summed.filt) <- NULL
+
+plotExpression(logNormCounts(summed.filt),
+               features = rownames(de.inspec[[cx]])[1],
+               x="Sample", colour_by ="Genotype",
+               other_fields = "louvain")+
+              facet_wrap(~louvain)+
+              ggtitle(glue::glue("{cx}: {rownames(de.inspec[[cx]])[1]}"))
+```
+
+## DESeq2
+
+-   Another popular method of calculating DEGs [DESeq2](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html)
+-   This DE comparision is based on un-normalised count data.
+-   Adjust the analysis design to fit your experimental question, this can be multifactoral.
+-   The `DESeq` function is a wrapper for estimation of size factors, estimation of dispersions and negative binomical GLM fitting.
+
+```{r}
+#| label: DESeq2-cluster
+rm(list = ls())
+# Load outcome of Clustering analysis 
+sce <- readRDS(here("results/Clustered.rds"))
+
+# Using the summed.filt save the col data in a variable, check that rows and columns match
+col_data <- colData(sce)
+all(rownames(col_data) %in% colnames(counts(sce)))
+all(rownames(col_data) == colnames(counts(sce)))
+
+# Design the analysis 
+dds_setup <- DESeqDataSetFromMatrix(countData = counts(sce),
+                              colData = col_data,
+                              design= ~ louvain) # For multifactor experiments you can add more variables here e.g. Batch + Clustering 
+
+# Define a comparison control group if desired
+dds_setup$louvain <- relevel(dds_setup$louvain, ref = "4")
+
+# Immediately results so it doesn't have to be rerun
+savefile <- here("results/deseq2_clusters.Rdata")
+if (file.exists(savefile)) {
+  load(savefile)
+} else {
+    ## use arguments recommended in vignette for single cell seq
+    dds <- DESeq(dds_setup, useT = TRUE,
+                 minmu = 1e-6, minReplicatesForReplace = Inf,
+                 fitType = "glmGamPoi", parallel = FALSE)
+    save(dds, file=savefile)
+}
+
+rm(col_data, dds_setup, savefile)
+```
+
+-   Use `resultsNames(dds)` to list all the coefficients/comparisons, specific comparisons can then be investigated.
+-   Adjust the FDR if desired (default 0.05).
+-   In addition to the Volcano plots `summary(res1)` will provide a table overview.
+
+```{r}
+#| label: volcano-DEGs
+#| fig-keep: last
+#| fig-width: 9
+#| fig-height: 6
+
+# t-SNE facted by Fixative as a reminder
+t <- plotTSNE(sce, colour_by = "louvain") +
+  facet_wrap( ~ colData(sce)$Genotype)
+
+# Make volcano plots, change data frame for each dataset
+res_names <- resultsNames(dds)
+res_objs <- map(res_names, ~ results(dds, name = .x, alpha = 0.05)) %>%
+  set_names(res_names)
+
+get_volcano_plots <- function(results_object) {
+  # convert and get sig demarked
+  res_volc <- results_object %>%
+    as.data.frame() %>%
+    dplyr::mutate(sig = ifelse(padj < 0.05, "FDR<0.05", "Not Sig")) %>%
+    dplyr::filter(!is.na(padj))
+  # make volcano plot
+  plot <- res_volc %>%
+    ggplot(aes(
+      log2FoldChange,
+      -log10(padj),
+      color = sig,
+      label = rownames(res_volc)
+    )) +
+    geom_point() +
+    geom_vline(xintercept = 0,
+               linetype = 'dashed',
+               color = 'blue') +
+    geom_text(aes(label = ifelse(
+      -log10(padj) > 20, as.character(rownames(res_volc)), ''
+    )), hjust = -0.1, vjust = 0.5) +
+    theme_bw()
+  return(plot)
+}
+
+volc_plots <- map(res_objs, get_volcano_plots)
+
+ggarrange(
+  t,
+  volc_plots$louvain_1_vs_4,
+  volc_plots$louvain_2_vs_4,
+  volc_plots$louvain_3_vs_4,
+  labels = c("t-SNE", "Cluster 1 vs 4", "Cluster 2 vs 4", "Cluster 3 vs 4")
+)
+
+rm(t, res_names, volc_plots)
+```
+
+-   DESeq2 results are exported here for further analysis via IPA or another Gene Ontology software, if preferred.
+    -   Alter filenames and significance threshold as required.
+
+```{r}
+#| label: DESeq2-cluster-export
+EnsembleID <- as.data.frame(rowData(sce)[,colnames(rowData(sce)) %in% c("Gene_Name", "Ensembl_ID")])
+
+# get significant data and add ensemble ID
+subset_results <- function(results_objects, comparison_name) {
+  res <- as.data.frame(results_objects[which(results_objects$padj <0.05), ])
+  res <- merge(res, EnsembleID, by=0)
+  res$comparison <- comparison_name
+  # there can be NA gene names
+  na_gene_names <- sum(is.na(res$Gene_Name))
+  if(na_gene_names != 0) {
+    print(paste0("WARNING: there are ", na_gene_names, " NA gene names in ", comparison_name))
+  }
+  #rownames(res) <- res$Gene_Name
+  return(res)
+}
+
+res_to_save <- map2(res_objs, names(res_objs), subset_results) 
+
+# note that you can use the following to see the duplicate gene names
+res_to_save$louvain_1_vs_4 %>%
+  janitor::get_dupes(Gene_Name)
+
+# merge sig data from all clusters to one to save
+res_to_save <- list_rbind(res_to_save)
+
+write_csv(res_to_save, here("results/deseq2_louvain_clusters_sig_genes.csv"))
+
+rm(res_to_save)
+```
+
+## Pseudo-bulk by Sample (optional)
+
+-   In cases where your data appears to cluster by sample type you can also compress via sample-type as well as clusters.
+-   Provided code for both EdgeR and DESeq2 below, for QC plots etc copy code from above as needed.
+
+### EdgeR
+
+- NOTE: I tried to clean up the later part of this chunk into a function, but `makeContrasts` really doesn't seem to play nice with `map` of a custom function for some reason...
+
+```{r}
+#| label: EdgeR-by-Sample
+#| eval: false
+# Using a sample group or individual sample e.g. Fixative.
+columnsToUse <- c("Sample", "louvain", "Genotype", "Sex", "Age", "chip")
+colData(sce) <- colData(sce) %>% 
+  data.frame() %>% 
+  dplyr::select(all_of(columnsToUse)) %>% 
+  DataFrame()
+summed <- aggregateAcrossCells(sce, 
+    				id = colData(sce)[,c("Sample")])
+
+test <- summed
+test$Genotype <- relevel(factor(test$Genotype), ref = "APP")
+
+cols_to_convert <- c("Genotype", "Sex", "Age", "chip")
+ref_levels <- c("APP", "M", "8wk", NA)
+# Prep data as before
+countsToUse <- counts(summed)
+colnames(countsToUse) <- colData(summed)$Sample
+
+summed <- convert_to_factor(summed, cols_to_convert, ref_levels)
+
+# summed$Fixative <- factor(summed$Fixative)
+# summed$Fixative <- relevel(summed$Fixative, ref = "Fresh")
+
+# Create DGEList object
+y <- DGEList(countsToUse, samples=colData(summed))
+
+# Filter out clusters with insufficient cells or low expression.
+discarded <- summed$ncells < 10
+y <- y[,!discarded]
+
+keep <- filterByExpr(y)
+y <- y[keep, , keep.lib.sizes=FALSE]
+
+# Calculate normalised library factors
+y <- calcNormFactors(y)
+
+# Set-up design 
+design <- model.matrix(~0 + Genotype, y$samples)
+
+# Estimate dispersions
+y <- estimateDisp(y, design, robust = TRUE)
+
+# Set Test parameters
+fit <- glmQLFit(y, design, robust = TRUE)
+
+# Generate pairwise comparisons using combn function
+comparisons <- combn(colnames(design), 2)
+
+# Convert output to vector of pairwise comparisons
+pairwise_comparisons <- apply(comparisons, 2, paste, collapse = "-")
+
+get_all_contrasts <- makeContrasts(contrasts = pairwise_comparisons, levels = design)
+res <- glmQLFit(fit, contrast = get_all_contrasts[, "GenotypeAbi3212FAPP-GenotypeAbi3KOAPP"])
+
+pairwise_comparisons <- apply(comparisons, 2, paste, collapse = " - ")
+pairwise_names <- apply(comparisons, 2, paste, collapse = "_vs_")
+con1 <- makeContrasts("test" = "GenotypeAbi3212FAPP - GenotypeAbi3KOAPP", levels = design)
+res2 <- glmQLFTest(fit, contrast = con1)
+
+test_function <- function(comparison_name, comparison_string, design_matrix, fit_obj) {
+  con <- makeContrasts(comparison_name = comparison_string, levels = design_matrix)
+  res <- glmQLFit(fit_obj, contrast = con)
+  return(res)
+}
+# no idea why this doesn't work...
+#res <- map2(pairwise_names, pairwise_comparisons, ~ test_function(.x, .y, design, fit))
+
+con1 <- makeContrasts("DSP_vs_Fresh" = FixativeDSP - FixativeFresh, levels = design)
+con2 <- makeContrasts("Methanol_vs_Fresh" = FixativeMethanol - FixativeFresh, levels = design)
+con3 <- makeContrasts("Glyoxal_vs_Fresh" = FixativeGlyoxal - FixativeFresh, levels = design)
+con4 <- makeContrasts("Glyoxal_vs_Methanol" = FixativeGlyoxal - FixativeMethanol, levels = design)
+ 
+res1 <- glmQLFTest(fit, contrast = con1)
+res2 <- glmQLFTest(fit, contrast = con2)
+res3 <- glmQLFTest(fit, contrast = con3)
+res4 <- glmQLFTest(fit, contrast = con4)
+
+EnsembleID <- as.data.frame(rowData(sce)[,colnames(rowData(sce)) %in% c("Gene_Name", "Ensembl_ID")])
+
+res1 <- as.data.frame(res1[which(res1$table$PValue <0.05), ])
+res1$Gene_Name <- rownames(res1)
+res1 <- merge(res1, EnsembleID, by="Gene_Name")
+rownames(res1) <- res1$Gene_Name
+
+res2 <- as.data.frame(res2[which(res2$table$PValue <0.05), ])
+res2$Gene_Name <- rownames(res2)
+res2 <- merge(res2, EnsembleID, by="Gene_Name")
+rownames(res2) <- res2$Gene_Name
+
+res3 <- as.data.frame(res3[which(res3$table$PValue <0.05), ])
+res3$Gene_Name <- rownames(res3)
+res3 <- merge(res3, EnsembleID, by="Gene_Name")
+rownames(res3) <- res3$Gene_Name
+
+res4 <- as.data.frame(res4[which(res4$table$PValue <0.05), ])
+res4$Gene_Name <- rownames(res4)
+res4 <- merge(res4, EnsembleID, by="Gene_Name")
+rownames(res4) <- res4$Gene_Name
+
+write.csv(res1, here("results/EdgeR DSP_vs_Fresh P0.05.csv"))
+write.csv(res2, here("results/EdgeR Methanol_vs_Fresh P0.05.csv"))
+write.csv(res3, here("results/EdgeR Glyoxal_vs_Fresh P0.05.csv"))
+write.csv(res4, here("results/EdgeR Glyoxal_vs_Methanol P0.05.csv"))
+
+rm(res1, res2, res3, res4, EnsembleID, con1, con2, con3, con4, countsToUse, 
+   design, fit, summed, y, columnsToUse, keep, tab, discarded)
+```
+
+### DESeq2
+
+Note that here one could use a design formula to specify all the columns you want to model with, but I find it much simpler to just have a compound column where you paste all the desired columns together and use that.
+
+For example, if you have an experiment with 2 genotypes ("A" and "B") at two time points (5 and 10) and you want to look at all the compound differential expressions, just paste those two columns together into a new factor which will have all 4 levels ("A_5", "A_10", "B_5" and "B_10").
+
+```{r}
+#| label: DESeq2-sample
+# Load data, post-integration merged counts or post-clustering if solo chip.
+sce <- readRDS(here("results/Clustered.rds"))
+
+# Make compound column - ensure it's a factor as well
+sce$compound_group <- factor(paste(sce$Genotype, sce$Sex, sce$Age, sep = "_"))
+
+# Save the col data in a variable, check that rows and columns match
+col_data <- colData(sce)
+all(rownames(col_data) %in% colnames(counts(sce)))
+all(rownames(col_data) == colnames(counts(sce)))
+
+# Design the analysis 
+dds_setup <- DESeqDataSetFromMatrix(countData = counts(sce),
+                              colData = col_data,
+                              design= ~ compound_group) 
+
+# Define a comparison control group if desired
+#dds_setup$Fixative <- relevel(dds_setup$Fixative, ref = "Fresh")
+
+
+# Immediately results so it doesn't have to be rerun
+savefile <- here("results/deseq2_samples_bulk.Rdata")
+# if you want to process in parallel
+parallel = FALSE
+if (file.exists(savefile)){
+    load(savefile)
+} else if (!parallel) {
+    ## use arguments recommended in vignette for single cell seq
+    dds <- DESeq(dds_setup, useT=TRUE,
+                 minmu=1e-6, minReplicatesForReplace=Inf,
+                 fitType = "glmGamPoi", parallel = FALSE)
+    save(dds, file=savefile)
+} else {
+  # set number of cores to use
+  BiocParallel::register(MulticoreParam(4))
+    ## use arguments recommended in vignette for single cell seq
+    dds <- DESeq(dds_setup, useT=TRUE,
+                 minmu=1e-6, minReplicatesForReplace=Inf,
+                 fitType = "glmGamPoi", parallel = TRUE)
+    save(dds, file=savefile)
+}
+rm(col_data, dds_setup, savefile)
+```
+
+#### Volcano plots
+
+I'll print just one volcano plot here, but I've generated one for all comparisons, so feel free to look at whichever you like
+
+```{r}
+res_names <- resultsNames(dds)
+res_objs <- map(res_names, ~ results(dds, name = .x, alpha = 0.05)) %>%
+  set_names(res_names)
+
+volc_plots <- map(res_objs, get_volcano_plots)
+volc_plots$compound_group_Abi3212FAPP_F_8wk_vs_Abi3212FAPP_F_6mo +
+  ggtitle("Abi3212FAPP_F_8wk_vs_Abi3212FAPP_F_6mo")
+```
+
+# Pathway analysis
+
+Here we use the `dds` object from `DESeq2` to get vectors of foldchanges that are named with entrezids for each comparison of interest.
+
+```{r}
+#| label: get-named-foldchanges
+# to view all the comparisons that exist
+unique(dds$compound_group)
+resultsNames(dds)
+
+# Function to allow whatever comparisons you want as a pair of strings
+get_named_foldchanges <- function(deseq2_obj = dds,
+                                  column_to_contrast = "Sample",
+                                  condition1 = "Fresh_Inhibitor",
+                                  condition2 = "Fresh_NoInhibitor") {
+  # make sure packages are loaded
+  require(AnnotationDbi)
+  require(org.Mm.eg.db)
+  
+  # print current comparison
+  print(paste0("Contrasting ", condition1, " against ", condition2))
+  
+  # get results obj
+  res <-
+    results(deseq2_obj, c(column_to_contrast, condition1, condition2))
+  
+  # convert gene refs
+  res$SYMBOL <- sub("_.*", "", rownames(res))
+  # add gene symbols
+  res$ensembl <- mapIds(
+    org.Mm.eg.db,
+    key = res$SYMBOL,
+    column = "ENSEMBL",
+    keytype = "SYMBOL",
+    multiVals = "first"
+  )
+  # add entrez
+  res$entrez <- mapIds(
+    org.Mm.eg.db,
+    key = res$ensembl,
+    column = "ENTREZID",
+    keytype = "ENSEMBL",
+    multiVals = "first"
+  )
+  
+  # get foldchanges
+  foldchanges <- res$log2FoldChange
+  # set names as entrezid
+  names(foldchanges) <- res$entrez
+  
+  return(foldchanges)
+}
+
+# You can either list all the contrasts you're interested in like so
+# comparison_1 <- c("Fresh_NoInhibitor", "Fresh_NoInhibitor")
+# comparison_2 <- c("Methanol_NoInhibitor", "Glyoxal_NoInhibitor")
+
+# Or list of all possible permeations
+unique_groups <- as.character(unique(dds$compound_group))
+
+comparisons_grid <- expand_grid(unique_groups, unique_groups) %>%
+  set_names("group1", "group2") %>%
+  # filter out cases where two columns match
+  dplyr::filter(group1 != group2) %>%
+  # make comparison names
+  dplyr::mutate(comparison_name = paste0(group1, "_vs_", group2))
+
+kbl(head(comparisons_grid))
+```
+
+Note that the if the number of comparisons is large, as it is in this case, getting the results can take a while.
+As such, I'll save the output and only use the function if the file doesn't exist.
+
+```{r}
+# Immediately save results so it doesn't have to be rerun
+savefile <- here("results/named_foldchanges.Rdata")
+if (file.exists(savefile)) {
+  load(savefile)
+} else {
+  # get the foldchanges for each fixative as a vector named with entrezid
+  named_fcs <-
+    map2(
+      comparisons_grid$group1,
+      comparisons_grid$group2,
+      ~ get_named_foldchanges(
+        column_to_contrast = "compound_group",
+        condition1 = .x,
+        condition2 = .y
+      )
+    ) %>%
+    set_names(comparisons_grid$comparison_name)
+    save(named_fcs, file=savefile)
+}
+# set names
+#names(named_fcs) <- paste0(comparison_1, "_vs_", comparison_2)
+# clean environment
+rm(get_named_foldchanges, comparisons_grid, unique_groups)
+```
+
+
+## GO pathways
+
+Now we use this to get the GO pathways.
+Note that we are using the mouse GO datasets, but you will want to swap this to whatever organism data is derived from.
+
+```{r}
+#| label: get-go-pathways
+# get go gage mouse data
+data("go.sets.mm")
+data("go.subs.mm")
+
+gobpsets <- go.sets.mm[go.subs.mm[["BP"]]]
+goccsets <- go.sets.mm[go.subs.mm[["CC"]]]
+gomfsets <- go.sets.mm[go.subs.mm[["MF"]]]
+
+gosets <- list("bp" = gobpsets, "cc" = goccsets, "mf" = gomfsets)
+
+get_go_pathways <- function(named_foldchanges, gosets_list) {
+  # get go pathways
+  gores <-
+    map(gosets_list, ~ gage::gage(named_foldchanges, gsets = .x, same.dir = TRUE))
+  
+  # join up and down pathways in one dataframe
+  pathways <-
+    map2_dfr(
+      gores,
+      names(gores),
+      ~ cbind(as_tibble(.x$greater, rownames = "pathway"), direction = "greater") %>%
+        rbind(cbind(
+          as_tibble(.x$less, rownames = "pathway"), direction = "less"
+        )) %>%
+        ## drop na pvals or pathways
+        drop_na(p.val, pathway) %>%
+        mutate(pathway_source = .y)
+    )
+  
+  return(pathways)
+}
+
+# Save the GO pathways as a csv, just reload if file already exists
+savefile <- here("results/go_pathways.csv")
+if (file.exists(savefile)) {
+  fix_go <- read_csv(savefile)
+} else {
+  # get the foldchanges for each fixative as a vector named with entrezid
+  fix_go <- purrr::map(named_fcs, ~ get_go_pathways(.x, gosets))
+  fix_go <-
+    map2(fix_go, names(fix_go), ~ dplyr::mutate(.x, comparison = .y)) %>%
+    list_rbind()
+  write_csv(fix_go, here("results/go_pathways.csv"))
+}
+rm(go.sets.mm, go.subs.mm, gobpsets, goccsets, gomfsets, gosets, get_go_pathways)
+```
+
+Now I'll filter to pathways where `p.val < 0.05`.
+
+```{r}
+#| label: deseq-go-pathways-dt
+
+## filter on pvals
+go_filtered <- fix_go[which(fix_go$p.val < 0.05), ]
+
+## print interactive table of go pathways
+kbl(head(go_filtered))
+## save the filtered pathways
+write_csv(go_filtered, here("results/go_pathways_fitlered.csv"))
+```
+
+The unfiltered GO pathways df has `r nrow(fix_go)` rows whilst the filtered has `r nrow(go_filtered)`.
+Note that this is with all comparisons combined.
+
+#### Inspect GO pathway data
+
+These tables show the total number of hits for each subgroup of the GO pathways
+
+```{r}
+## how many significant pathways by group
+go_filtered %>%
+  dplyr::group_by(pathway_source, direction) %>%
+  dplyr::summarise(n = n()) %>%
+  kbl(caption = "Total hits across all comparisons")
+
+go_filtered %>%
+  dplyr::group_by(comparison, pathway_source, direction) %>%
+  dplyr::summarise(n = n()) %>%
+  datatable(
+    filter = 'top',
+    options = list(pageLength = 5),
+    caption = "Total hits by comparison"
+  )
+```
+
+Here we count how many pathways we have for each group with a `p.val < 0.05` and plot the top 10 pathways by `p.val`.
+I'll just print one of the plots again, but the rest are all there to explore.
+
+```{r}
+#| label: inspect-go-data
+
+## plot top 10 significant pathways for a group
+go_top_ten <- go_filtered %>%
+  ## add pathways with GO ID (11 characters + a space) stripped out
+  dplyr::mutate(pway_stripped = substr(pathway, 12, nchar(pathway))) %>%
+  ## sort by p.val
+  dplyr::arrange(p.val) %>%
+  ## top 10 rows per source
+  group_by(comparison, pathway_source) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  ## order data
+  dplyr::mutate(pway_stripped = tidytext::reorder_within(pway_stripped, abs(stat.mean), 
+                                               direction)) %>%
+  # add labels to pathway source
+  labelled::set_value_labels(
+    pathway_source = c(
+      "Biological Processes" = "bp",
+      "Cellular Component" = "cc",
+      "Molecular Function" = "mf"
+    )
+  )
+
+plot_top_pathways <- function(data, comparison_group, go_component) {
+  plot <- data %>%
+    # dplyr::filter(comparison == comparison_group &
+    #                 pathway_source == go_component) %>%
+    dplyr::filter(comparison == comparison_group) %>%
+    ggplot(aes(abs(stat.mean), pway_stripped, fill = direction)) +
+    geom_bar(stat = "identity") +
+    scale_fill_brewer(palette = "Dark2") +
+    tidytext::scale_y_reordered(
+      labels = function(x)
+        str_wrap(str_replace_all(x, "foo" , " "),
+                 width = 40)
+    ) +
+    ylab("") +
+    xlab("mean") +
+    ggtitle(paste0(comparison_group, " - top 10 pathways significant pathways")) +
+    theme_bw() +
+    theme(legend.position = "bottom") +
+    facet_wrap( ~ pathway_source)
+}
+
+top_go_plots <- map(unique(go_top_ten$comparison), ~ 
+                         plot_top_pathways(go_top_ten, .x, "bp")) %>%
+  set_names(unique(go_top_ten$comparison))
+
+top_go_plots$APP_F_6mo_vs_APP_F_8wk
+# an example of saving a plot with a specific colour scheme
+# ggsave("figures/go_pathways.svg", p1 + 
+#          scale_fill_manual(values = c("#0b17ad", "#ffeb3b")) + 
+#          ggtitle(NULL))
+# write_rds(go_filtered, file = "figures/go_pathways.rds")
+rm(go_filtered, top_go_plots, go_top_ten)
+```
+
+## KEGG pathways
+
+Now we do the same but for KEGG pathways.
+
+```{r}
+#| label: get-kegg-pathways
+# get kegg data
+data(kegg.sets.mm)
+# subset of kegg that only contains signalling and metabolic pathways
+data(sigmet.idx.mm)
+
+# get kegg pathways
+get_kegg_pathways <- function(named_foldchanges,
+                              subset_pathways = TRUE) {
+    if(subset_pathways) {
+        ## subset kegg pathways
+        kegg.sets.mm <- kegg.sets.mm[sigmet.idx.mm]
+    }
+    ## get kegg pathways
+    keggres <- gage::gage(named_foldchanges, gsets = kegg.sets.mm, same.dir = TRUE)
+    return(keggres)
+}
+
+# get the kegg pathways for each fixative
+fix_kegg <- map(named_fcs, ~ get_kegg_pathways(.x))
+
+# function to join the go pathway outputs together
+join_pathways <- function(pathways_obj, comparison) {
+    ## get the greater and lesser pathway data
+    df_g <- cbind(as.data.frame(pathways_obj$greater),
+                  direction = "greater")
+    df_l <- cbind(as.data.frame(pathways_obj$less),
+                  direction = "less")
+    ## combine the rows
+    df <- rbind(df_g, df_l)
+    ## add comparison
+    df$comparison <- comparison
+    ## get pathways as a column
+    df <- rownames_to_column(df, var = "pathway")
+    return(df)
+}
+
+# apply function
+fix_kegg_join <- map2(fix_kegg, names(fix_kegg), ~ join_pathways(.x, .y))
+
+# combine the list elements
+fix_kegg_all <- do.call(rbind, fix_kegg_join) %>%
+    drop_na(p.val, pathway)
+
+# Save KEGG data as csv
+write_csv(fix_kegg_all, here("results/kegg_pathways.csv"))
+# Remove objects not required for generating figures
+rm(dds, fix_kegg, fix_kegg_join, kegg.sets.mm, sigmet.idx.mm, 
+   get_kegg_pathways, join_pathways)
+```
+
+Again, we filter to significant (`p.val < 0.05`) pathways.
+
+```{r}
+#| label: deseq-kegg-pathways-dt
+
+## filter on pvals
+kegg_filtered <- fix_kegg_all[which(fix_kegg_all$p.val < 0.05), ]
+
+## print interactive table of kegg pathways
+datatable(kegg_filtered, filter = 'top', options = list(pageLength = 5), 
+          rownames = FALSE)
+```
+
+The unfiltered KEGG pathways df has `r nrow(fix_kegg_all)` rows whilst the filtered has `r nrow(kegg_filtered)`.
+Note that this is again with all comparisons combined.
+
+#### KEGG visualisation
+
+We can use the `pathview` package to get some nice annotated images of the KEGG pathways.
+`pathview` downloads the images, which can take a while, so I've set `eval=FALSE` to not slow down rendering.
+
+Also note that I had some trouble with some particular pathways giving an error and couldn't figure out the cause, so I've structured the function to just skip over those cases.
+
+```{r}
+#| label: deseq-kegg-pathway-visualisation
+#| eval: false
+
+## get kegg pathway ids
+## the pathway id is the first 8 characters, subset to these
+kegg_filtered$keggresids <- substr(kegg_filtered$pathway, start = 1, stop = 8)
+# get this as a list for map
+keggres_list <- map(unique(kegg_filtered$comparison), ~ kegg_filtered %>%
+                      dplyr::filter(comparison == .x) %>%
+                      .$keggresids) %>%
+  set_names(unique(kegg_filtered$comparison))
+
+## subset to foldchanges for relevant comparison
+
+# download images with foldchanges applied
+pathview_function <-
+  function(keggresids,
+           named_foldchanges,
+           comparison,
+           organism = "mmu") {
+    tmp <-
+      map(keggresids, ~ if (!file.exists(paste0(
+        here("results/kegg_pathways/"), .x, ".", comparison, ".png"
+      ))) {
+        print(paste0(
+          here("results/kegg_pathways/"),
+          .x,
+          ".",
+          comparison,
+          ".png"
+        ))
+        tryCatch(
+          pathview(
+            gene.data = named_foldchanges,
+            pathway.id = .x,
+            species = organism,
+            kegg.dir = "kegg_dir",
+            out.suffix = comparison
+          ),
+          error = function(e)
+            NULL
+        )
+      } else {
+        print("Pathway image already exists")
+      })
+  }
+setwd(here("results/kegg_pathways/"))
+# subset named fc to match keggresids
+named_fcs_subset <- named_fcs[names(named_fcs) %in% names(keggres_list)]
+# there are duplicate entries for some reason, remove them
+#named_fcs_subset_unique <- map(named_fcs_subset, ~ .x[!duplicated(names(.x))])
+
+arguments <- list(keggres_list, named_fcs_subset, names(keggres_list))
+tmp <- pmap(arguments, pathview_function)
+
+# return to prior working dir
+setwd(here())
+```
+
+```{r}
+#| include: false
+#| eval: false
+
+# try the specific pathway id that causes the error
+# the error would appear to have something to do with the colour, but changing
+# the pallete doesn't seem to resolve it either...
+pathview(gene.data = named_fcs_subset[[3]],
+                              pathway.id = "mmu00510", species = "mmu",
+                              kegg.dir = "kegg_dir", out.suffix = names(keggres_list)[3],
+         color.norm = "zscore", color.palette = "blueyellow")
+```
+
+Here is an example of an annotated pathway:
+
+```{r}
+#| label: kegg-pathways
+#| fig-height: 8
+#| fig-width: 9
+
+knitr::include_graphics(here(
+  "results/kegg_pathways/mmu03015.Abi3KOAPP_M_8wk_vs_APP_F_6mo.png"
+))
+
+rm(keggresids, pathways, pathways_filtered, EnsembleID)
+```
+
+## Clustering independent DA
+
+-   Other methods like [miloR](https://doi.org/10.1038/s41587-021-01033-z) investigate DA *without* relying on the cluster information but using k-nearest neighbor graph, means the analysis won't need to be re-run if clustering is updated.
