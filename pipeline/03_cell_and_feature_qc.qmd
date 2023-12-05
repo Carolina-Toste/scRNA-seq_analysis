@@ -13,7 +13,7 @@ source(here::here("scripts/setup.R"))
 ```{r}
 # make function to read in cogent outputs
 read_cogent <-
-  function(path_to_output = "../../../CogentAP 2.0 analysis results of Syk Chip for Mateus Nov 22",
+  function(path_to_output = "../../../CogentAP 2.0 analysis results of Syk Chip Nov 22",
            file_pattern = "*genematrix.csv",
            filter_string = "/extras/",
            exclude_folders = NULL) {
@@ -151,16 +151,6 @@ stats <- read_csv(here("data/2023-02-28_cogent2_stats.csv"))
 gene_matrix <- read_csv(here("data/2023-02-28_cogent2_gene-matrix.csv"))
 gene_info <- read_csv(here("data/2023-02-28_cogent2_gene-info.csv"))
 ```
-
-- NOTE: **TODO** - ask Elena/Carolina to double-check that the files I've read in are the same as what they've been working with
-
--   Read in the other file-types, you will need to put these files in the same folder as this script.
-    -   If there are files from multiple chips ensure correct `fn` selected
-    -   Adds percentage read values in stats data
-    -   Identify the controls and samples
-    -   Displays, then removes all Short, Unselected or Undetermined reads from subsequent analysis
-    -   To look at a snapshot of the tables use `head(stats)` or `head(gene_info)`
-    -   Replace the chip name as needed
 
 ```{r}
 #| label: data-prep
