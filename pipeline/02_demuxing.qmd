@@ -1,0 +1,206 @@
+---
+title: "Demuxing and Allignment"
+order: 2
+execute: 
+  eval: false
+---
+
+-   You use the HAWK supercomputer via a linux user interface, I like [MobaXTerm](https://mobaxterm.mobatek.net/download.html) but others like [Ubuntu](https://ubuntu.com/download/desktop) are popular too.
+    -   If needed make a [SCW account and project](https://scw.bangor.ac.uk/en-gb/).
+    -   Training can be booked via [CORE](https://www.cardiff.ac.uk/advanced-research-computing/support/training) or [here](https://arcca.github.io/)
+    -   check that the latest version is installed by looking in the `/apps/genomics/` directory.
+        -   Current version is 1.5.1 and has both the hg38 and mm10 genomes installed.
+    -   If you need a later version IT Service Desk will install or download a local copy of it to put in your scratch drive. Be aware that there are issues with the way mitochondrial genes are named, you will need to update "MT" to be "mt" in the .GTF file using sed -i 's/MT/mt/g' Mus_musculus.GRCm39.104.edit.gtf.
+
+## Concatenate Samples (optional)
+
+-   If needed (often easier) concatenate the R1 and R2 files so there is one fastq file per sample for all R1 reads and one for all R2 reads
+    -   Can adapt the sampleIDs and the script below `concatenate_samples.sh` written by Sumukh Deshpande.
+    -   `squeue -u c.yourusername` can be used to check on progress of scripts, to get automated emails on completion/error include the following lines in your SLURM script: `#SBATCH --mail-user=youremail@cardiff.ac.uk    #SBATCH --mail-type=ALL`
+
+```{bash}
+#!/bin/bash
+
+sampleIDs=("Sample1" "Sample2" "Sample3")
+
+declare -a sampNameR1=()
+declare -a sampNameR2=()
+
+for sampleID in "${sampleIDs[@]}"
+do
+	sampNameR1+=("${sampleID}/${sampleID}*_1.fastq.gz")
+	echo $sampleID
+done
+
+for sampleID in "${sampleIDs[@]}"
+do
+        sampNameR2+=("${sampleID}/${sampleID}*_2.fastq.gz")
+        echo $sampleID
+done
+
+joinByChar() {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+var1=`joinByChar ' ' "${sampNameR1[@]}"`
+echo "$var1"
+
+var2=`joinByChar ' ' "${sampNameR2[@]}"`
+echo "$var2"
+
+$(cat $var1 > R1.fastq.gz)
+$(cat $var2 > R2.fastq.gz)
+```
+
+## Demux Script
+
+-   The demuxing will take the barcodes from the sequencing and allign them to the sampleID in your triaged well-list from the iCell8 software.
+-   Again, ensure the CogentAP is the latest version, IT will have to upgrade it if not. Version located here on HAWK `/apps/genomics/cogentap/1.5.1/CogentAP/`
+-   To run this code you will need the following file set-up in your scratch drive: ![](FileSetup.png)
+-   Your **input** folder should contain:
+    -   R1.fastq.gz
+    -   R2.fastq.gz
+    -   Triaged_WellList.txt
+-   Your **bin** folder should contain a "OUT" and "ERR" folder as well as the `cogentAP_demux_musmus.sh` script. **sampleIDs**, **userProject**, **myDir**, **myEmail** and **myWellList** will need to be altered to match your dataset and SCW project number.
+    -   If you haven't run this script before you will need to add "executable permissions" using `chmod u+x`
+    -   run script `./cogentAP_demux_musmus.sh`
+
+```{bash}
+#!/bin/bash
+module purge 
+module load anaconda/2021.11
+eval "$(/apps/languages/anaconda/2020.02/bin/conda shell.bash hook)"
+module load cogentap/1.5.1
+
+sampleIDs=("ChipNickname")
+userProject="scw1870"
+myDir="/scratch/c.username/parentfolder"
+myEmail="email@cardiff.ac.uk"
+myWellList="Triaged_WellList.TXT"
+
+mem="80G"
+nodes="4"
+runTime="2-00:00"
+scriptBase="Demux"
+jobName="CogentAP_demux"
+
+for sampleIDs in "${sampleIDs[@]}"
+do
+        scriptName=${myDir}/temp/${scriptBase}.${sampleIDs}.sh
+        rm -rf ${scriptName} || true
+        touch ${scriptName}
+
+        echo "#!/bin/bash" >> ${scriptName}
+        echo "#SBATCH -p htc" >> ${scriptName}
+        echo "#SBATCH --mem=${mem}" >> ${scriptName}
+        echo "#SBATCH --ntasks=${nodes}" >> ${scriptName}
+        echo "#SBATCH --ntasks-per-node=${nodes}" >> ${scriptName}
+        echo "#SBATCH -t ${runTime}" >> ${scriptName}
+        echo "#SBATCH -o ${myDir}/bin/OUT/${scriptBase}${jobName}.%J.TXT" >> ${scriptName}
+        echo "#SBATCH -e ${myDir}/bin/ERR/${scriptBase}${jobName}.%J.TXT" >> ${scriptName}
+        echo "#SBATCH --job-name=${jobName}" >> ${scriptName}
+        echo "#SBATCH --account=${userProject}" >> ${scriptName}
+	echo "#SBATCH --mail-user=${myEmail}" >> ${scriptName}
+	echo "#SBATCH --mail-type=END" >> ${scriptName}
+
+	echo "/apps/genomics/cogentap/1.5.1/CogentAP/cogent demux \
+		-i ${myDir}/input/L2_R1.fastq.gz \
+		-p ${myDir}/input/L2_R2.fastq.gz \
+		-b ${myDir}/input/${myWellList} \
+	 	-t ICELL8_FLA \
+		-o ${myDir}/output/demux/${sampleIDs}"  >> ${scriptName}
+
+        chmod u+x ${scriptName}
+
+        sbatch ${scriptName}
+
+        echo $sampleIDs
+done
+
+exit
+```
+
+-   To check on the status of this program you can type `squeue -u c.username` with your cardiff username, you can also include code in the SLURM script that will email you once the job is complete or if there are any errors: `echo "SBATCH --mail-user=abc1@cardiff.ac.uk"` `echo "SBATCH --mail-type=ALL"`
+-   Any error messages or output messages will appear the the respective folders under the **bin** folder, they will be sorted by SLURM jobID.
+-   Your **output** folder should contain a demux.log, counts.csv file, demuxed folders for each barcode.
+-   Check the demux has been succesful by reading the log file.
+-   These can then be aligned to the correct genome and trimmed.
+
+## Analysis Script
+
+-   This step will allign your sequencing reads to a reference genome, trimming off any adapter sequences so **ensure you have the correct reference genome**. Additionally this will count genes and transcripts and generate a HTML report summary.
+-   The script below is for *mm10* prebuilt in Cogent.
+-   For human datasets you will need to change the genome, to *hg38*.
+-   Any other genomes or if you need to update one follow Takara's user manual (Section V.E.2) to download *.gtf* and *.fa* files and send the script below to IT to add the genome to the `/apps/genomics/cogentap/20200210/CogentAP/cogent`. General users lack permissions to do this.
+-   Utilising the same files as the previous script add the `cogentAP_analyze_musmus.sh` script to the **bin** folder.
+-   All of the files are in your **output** folder from the previous script.
+-   Ensure the **sampleIDs**, **userProject**, **myDir** and **myEmail** match what you used in the demux.
+    -   The skip_trimming command is optional, if you have a very large dataset you will need to include it. There should be very little change to the dataset if the adapter trimming is skipped.
+    -   Make executable `chmod u+x`
+    -   run script `./cogentAP_analyse_musmus.sh`
+
+```{bash}
+#!/bin/bash
+module purge
+module load anaconda/2021.11
+eval "$(/apps/languages/anaconda/2021.11/bin/conda shell.bash hook)"
+module load cogentap/1.5.1
+
+sampleIDs=("ChipNickname")
+userProject="scw1870"
+myEmail="user@cardiff.ac.uk"
+myDir="/scratch/c.user/ParentFolder"
+
+mem="150G"
+nodes="20"
+runTime="3-00:00"
+scriptBase="Cogent_Analyse"
+jobName="CogentAP_analyse"
+
+
+for sampleIDs in "${sampleIDs[@]}"
+do
+        scriptName=${myDir}/temp/${scriptBase}.${sampleIDs}.sh
+        rm -rf ${scriptName} || true
+        rm -rf ${myDir}/output/analysis || true
+	touch ${scriptName}
+
+        echo "#!/bin/bash" >> ${scriptName}
+        echo "#SBATCH -p highmem" >> ${scriptName}
+        echo "#SBATCH --mem=${mem}" >> ${scriptName}
+        echo "#SBATCH --ntasks=${nodes}" >> ${scriptName}
+        echo "#SBATCH -t ${runTime}" >> ${scriptName}
+        echo "#SBATCH -o ${myDir}/bin/OUT/${scriptBase}${jobName}.%J.TXT" >> ${scriptName}
+        echo "#SBATCH -e ${myDir}/bin/ERR/${scriptBase}${jobName}.%J.TXT" >> ${scriptName}
+        echo "#SBATCH --job-name=${jobName}" >> ${scriptName}
+        echo "#SBATCH --account=${userProject}" >> ${scriptName}
+	echo "#SBATCH --mail-user=${myEmail}" >> ${scriptName}
+	echo "#SBATCH --mail-type=END" >> ${scriptName}	
+
+        echo "/apps/genomics/cogentap/1.5.1/CogentAP/cogent analyze \
+		-i ${myDir}/output/demux/${sampleIDs} \
+		-g mm10 \
+		-o ${myDir}/output/analysis/${sampleIDs} \
+ 		-t ICELL8_FLA \
+		--skip_trimming \
+		--threads 20" >> ${scriptName}
+
+        chmod u+x ${scriptName}
+
+        sbatch ${scriptName}
+
+        echo $sampleIDs
+done
+
+
+exit
+```
+
+-   Check the Analyser log to ensure the data has been correctly processed.
+-   You will need the following **3** files per sample for all subsequent analyses:
+    -   genematrix.csv
+    -   stats.csv
+    -   geneinfo.csv
+-   The following workflow is based on the [OSCA book](https://bioconductor.org/books/release/OSCA/)

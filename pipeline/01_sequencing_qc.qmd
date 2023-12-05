@@ -1,0 +1,27 @@
+---
+title: "Sequencing QC"
+order: 1
+---
+
+-   Fastq files can be directly transferred to your **gluster** account, we normally keep the raw sequencing data until the post-bcl2fastq conversion data has been confirmed.
+
+-   Once in your gluster you can transfer to your scratch area when processing files (not for long term storage), using `gzip` or `tar` compression will speed this up.
+
+    -   I use the `screen` command followed by `cp -R /gluster/dri02/rdspt/shared/rdspt/scRNAseq_Data_Archive /scratch/c.username`
+    -   Check the filesize is the same after transfer using `ls -lh` command.\
+
+-   This de-multiplexing will require the i5 and i7 index sequences (Appendix A SMART-Seq ICELL8 cx Application Kit User Manual), also can be found on your well_list.txt file.
+    *Note:* Depending on the sequencer used the indexes may need to be entered in reverse complement, see [here](https://support.illumina.com/sequencing/sequencing_software/bcl2fastq-conversion-software.html?langsel=/us/) for more detail.
+
+-   There should be 2 Illumina fastq files or read types per well;
+
+    -   Read 1.
+    -   Read 2.
+
+-   Check the FASTQC html report to look at the per base sequence quality and mean quality scores [definitions](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/)
+
+-   Can use multiQC for an overview of multiple samples.
+
+-   **The de-multiplexing, allignment and counting can all be performed using the mappa software** if interested in learning ask the Webber group.
+
+-   [**Takara User Guide**](https://www.takarabio.com/a/205948), we use the command line interface (section V.C).
