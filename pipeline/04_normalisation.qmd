@@ -86,7 +86,7 @@ saveRDS(sce, here("results/normalised_Deconvolution.rds"))
 
 ## CPM or TPM (alternative)
 
--   While not always recommended for sc-Seq data, CPM (Counts Per Million) and TPM (Transcripts Per Million) are used by the R pipeline developed by Takara [Hanata](https://www.takarabio.com/documents/User%20Manual/hanta%20R%20kit%20v1.0%20User%20Guide/hanta%20R%20kit%20v1.0%20User%20Guide_060719.pdf) and Ata/Mateus to normalise the data.
+-   While not always recommended for sc-Seq data, CPM (Counts Per Million) and TPM (Transcripts Per Million) are used by the R pipeline developed by Takara [Hanata](https://www.takarabio.com/documents/User%20Manual/hanta%20R%20kit%20v1.0%20User%20Guide/hanta%20R%20kit%20v1.0%20User%20Guide_060719.pdf)
     -   CPM is the number of reads aligning to a gene scaled by number of sequenced fragments
     -   TPM is the relative proportion of transcripts in the library"
     -   You can also include a filter that will remove genes with low CPM/TPM (e.g. \<1 and \<5).
