@@ -1,0 +1,474 @@
+---
+title: "Normalising counts"
+---
+
+```{r}
+#| label: source packages needed
+# load packages needed
+source(here::here("scripts/setup.R"))
+```
+
+```{r}
+#| label: readRDS
+sce <- readRDS(here("results/filtered_genes.rds"))
+```
+
+-   Needed due to differences in sequencing coverage, both technical (e.g. differences in PCR amplification) and biological. By removing technical differences it allows meaningful comparison of expression profiles between cells.
+-   CPM, TPM and DESeq size factor are common scaling normalisations not really suited for sparse sc-Seq data.
+-   Some normalisations developed for scSeq data [detailed descriptions](http://bioconductor.org/books/3.15/OSCA.basic/normalization.html).
+
+## Deconvolution {.tabset}
+
+-   (Lun et al 2016)
+    -   Defines a pool of cells, sums the expression values from all pooled cells then normalise against an average reference. Computes a scaling factor.
+    -   This is repeated multiple times, cells are detected in multiple pools.
+    -   From this series of equations you can de-convolve pools to get scaling factors for each cell.
+    -   The min.mean is the scalar specifying the minimum average count of genes to be used for normalisation.
+-   Calculate `librarySizeFactors` (Scuttle)
+    -   **#QUESTION** How does this work if library size factor is bimodal?
+    -   Per cell proportional to the library size so that the average size factor for each cell is one.
+    -   If the differential expression is unbalanced than this may not be an appropriate in normalising expression between clusters, though this analysis should have minimal impact on cluster separation and highly expressed marker genes.
+
+```{r}
+#| label: lib-sf
+lib.sf <- librarySizeFactors(sce)
+dd <- data.frame("log10libSf"=log10(lib.sf))
+ggplot(dd, aes(x=log10libSf, fill = colData(sce)$Sample)) + 
+  geom_histogram(bins=50, position = "identity", alpha = 0.5) +
+      labs(y = "Frequency", x = "Library Size Factor (Log10)") +
+    guides(fill=guide_legend(title="Sample"))
+```
+
+-   Create a pool of cells by clustering, the number of cells per cluster are:\
+
+```{r}
+#| label: pooled-factors
+#| eval: false
+# Cluster cells by similarity, most  suited to 10x numbers
+set.seed(100)
+clust <- scran::quickCluster(sce) # stores which cluster each cell was assigned too.
+table(clust) # summarises number of clusters and cells in each cluster
+sce <- computePooledFactors(sce, clusters = clust, min.mean = 0.1) # computes size factors, referred to as computeSumFactors in scran package
+deconv.sf <- sizeFactors(sce)
+```
+
+-   Deconvolve this data and plot the library size factor against the deconvolved size factor, most should be a linear relationship.
+
+```{r}
+#| label: deconv-plot
+#| fig-height: 4
+#| fig-width: 5
+#| eval: false
+colData(sce)$cell_sparsity <- 1 - (colData(sce)$detected / nrow(sce))
+
+deconvDf <- data.frame(lib.sf, deconv.sf,
+                       "source_name" = sce$Sample,
+                      "sum" = sce$sum,
+                      "mito_content" = sce$subsets_mito_percent,
+                      "cell_sparsity" = sce$cell_sparsity)
+
+ggplot(deconvDf, aes(x=lib.sf, y=deconv.sf, col=sce$Sample))+
+  geom_point() + geom_abline(intercept=0, slope=1, color="red")
+
+rm(dd, deconvDf, clust, deconv.sf, detected_genes, lib.sf)
+```
+
+-   Apply these normalised values to your sce object using `scater::logNormCounts()`
+-   Save filtered sce as an RDS (can be re-loaded later)
+
+```{r}
+#| label: logNormCounts
+#| eval: false
+sce <- logNormCounts(sce)
+assays(sce)
+saveRDS(sce, here("results/normalised_Deconvolution.rds"))
+```
+
+## CPM or TPM (alternative)
+
+-   While not always recommended for sc-Seq data, CPM (Counts Per Million) and TPM (Transcripts Per Million) are used by the R pipeline developed by Takara [Hanata](https://www.takarabio.com/documents/User%20Manual/hanta%20R%20kit%20v1.0%20User%20Guide/hanta%20R%20kit%20v1.0%20User%20Guide_060719.pdf) and Ata/Mateus to normalise the data.
+    -   CPM is the number of reads aligning to a gene scaled by number of sequenced fragments
+    -   TPM is the relative proportion of transcripts in the library"
+    -   You can also include a filter that will remove genes with low CPM/TPM (e.g. \<1 and \<5).
+    -   The mean number of detected genes across all cells will be provided in a table alongside each of the cut-off values.
+    -   This will save as a separate RDS file if you wish to compare the normalisation methods.
+
+```{r}
+#| label: CPM-TPM
+sce <- logNormCounts(sce)
+
+# Normalize data
+cpm(sce) <- calculateCPM(sce)
+tpm(sce) <- calculateTPM(sce, lengths = rowData(sce)[, "Gene_Length"])
+
+# Add QC for cells and number of genes detected to colData
+genes_detected_1TPM <- apply(X = tpm(sce), MARGIN = 2, FUN = function(x) length(which(x > 1)))
+genes_detected_5TPM <- apply(X = tpm(sce), MARGIN = 2, FUN = function(x) length(which(x > 5)))
+genes_detected_1c <- apply(X = counts(sce), MARGIN = 2, FUN = function(x) length(which(x > 1)))
+genes_detected_5c <- apply(X = counts(sce), MARGIN = 2, FUN = function(x) length(which(x > 5)))
+
+colData(sce) <- cbind(colData(sce), data.frame(genes_detected_1TPM = genes_detected_1TPM,
+                                               genes_detected_5TPM = genes_detected_5TPM,
+                                               genes_detected_1c = genes_detected_1c,
+                                               genes_detected_5c = genes_detected_5c))
+
+df <- cbind(data.frame(genes_detected_1TPM = genes_detected_1TPM,
+                                               genes_detected_5TPM = genes_detected_5TPM,
+                                               genes_detected_1c = genes_detected_1c,
+                                               genes_detected_5c = genes_detected_5c))
+
+df %>% summarise(mean_genes_detected_1TPM = mean(genes_detected_1TPM), 
+          mean_genes_detected_5TPM = mean(genes_detected_5TPM),
+          mean_genes_detected_1CPM = mean(genes_detected_1c),
+          mean_genes_detected_5CPM = mean(genes_detected_5c))
+
+saveRDS(sce, here("results/normalised_CPM_TPM.rds"))
+rm(genes_detected_5c, genes_detected_1c, genes_detected_1TPM, genes_detected_5TPM, df)
+```
+
+##{-}
+
+# Dimension Reduction Analysis
+
+-   Want to focus on biologically meaningful variation, one way to do this is to focus the PCA/clustering on the most highly variable genes.
+
+    -   For ease use common gene names instead of EnsembleID_GeneName format currently used, will add ".1" etc if any gene names aren't unique (optional).
+
+```{r}
+#| label: rowname-symbol
+rownames(sce) <- uniquifyFeatureNames(rownames(sce), rowData(sce)$Gene_Name)
+```
+
+-   `modelGeneVar` will help select the most variable genes based on the logcount data, assuming no spike-in controls, it will model the relationship between the mean and the variance, plotted below:
+
+```{r}
+#| label: var-genes
+gene_var <- modelGeneVar(sce, assay.type = "logcounts")
+
+gene_var %>% 
+  # convert to tibble for ggplot
+  as_tibble() %>% 
+  # make the plot
+  ggplot(aes(mean, total)) +
+  geom_point() +
+  geom_line(aes(y = tech), colour = "dodgerblue", linewidth = 1) +
+  labs(x = "Mean of log-expression", y = "Variance of log-expression")
+```
+
+-   Use `getTopHVGs` to get the most variable genes, no set rule on number of genes to picked start with 10 % and adjust if needed.
+
+```{r}
+#| label: hvgs
+hvgs <- getTopHVGs(gene_var, prop=0.1)
+```
+
+-   There are `r length(hvgs)` highly variable genes that have been identified
+-   Expression of top 20 highly variable genes:
+
+```{r}
+#| label: plot-hvgs
+plotExpression(sce, features = hvgs[1:20], point_alpha = 0.05, jitter = "jitter")
+```
+
+## PCA {.tabset}
+
+-   Principal Component Analysis (PCA) is the direction where the data is most spread out i.e. has the **highest variance**, can be both biological but also technical variation too.
+    -   The 1st principle component explains the most variance the data, followed by PC2, PC3 etc.
+    -   Looking for the minimum number of PC's to explain \~80 % of the variation in the library, can also use a "elbow" method on a scree plot.
+    -   Adds PC results into a Dimension Reductions (reduced Dims) slot, assumes that 50 PCs will capture most variance so defaults to this ncomponents.
+    -   
+    -   This PCA will be based on **only the highly variable genes** determined above. ++ Use `reducedDim(sce, "PCA")[1:10, 1:5]` to view the first few rows/columns.
+
+```{r}
+#| label: run-PCA
+sce <- runPCA(sce, subset_row = hvgs)
+
+# extract variance explained
+pca_pct_variance <- data.frame(variance = attr(reducedDim(sce, "PCA"), "percentVar"))
+pca_pct_variance$PC <- 1:nrow(pca_pct_variance)
+```
+
+-   Select number of principal components by finding the "elbow" of the scree plot, this can also be calculated from the `findElbowPoint` function (see `line 930` below)
+
+```{r}
+#| label: scree-plot
+pca_pct_variance %>% 
+  ggplot(aes(PC, variance)) +
+  geom_col() +
+  labs(y = "Variance explained (%)")
+```
+
+-   Basic PCA plots, `ncomponents` argument allows you to state the number of PCs you wish to compare.
+
+```{r}
+#| label: PCA_basic
+plotReducedDim(sce, dimred = "PCA", ncomponents = 5, colour_by = "Sex")
+```
+
+-   Customise your PCA plot with `ggcells` to look at experimental factors impact on the PC plot, e.g. Genotype, chip, sample processing day, genes detected etc.
+
+```{r}
+#| label: PCA-custom
+# more custom visualisations with ggcells (e.g. add facets)
+ggcells(sce, aes(x = PCA.2, y = PCA.3, colour = Genotype)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ Sex) +
+  labs(x = "PC2", y = "PC3", colour = "Genotype", title = "Genotype")
+
+ggcells(sce, aes(x = PCA.1, y = PCA.2, colour = detected)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~ Genotype) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(x = "PC1", y = "PC2", colour = "detected genes", title = "Genotypebydetectedgenes")
+```
+
+## Interpreting Principal Components
+
+-   Determine if there are any relationships between your experimental variables and PC scores.
+
+    -   Change a list of variables to match **your** experimental design from `colnames(colData(sce))`
+
+```{r}
+#| label: explan-pcs
+explan_pcs <- getExplanatoryPCs(sce,
+    variables = c(
+        "sum",
+        "detected",
+        "Sample",
+        "Sex",
+        "Genotype",
+        "No_of_Genes",
+        "Exon_Reads",
+        "subsets_mito_percent"
+    )
+)
+plotExplanatoryPCs(explan_pcs/100)
+
+rm(explan_pcs)
+```
+
+-   Calculate the percentage of variance in each genes expression "explained" by a technical or biological variable.
+
+```{r}
+#| label: vars-explained
+#| fig-height: 3
+#| fig-width: 6
+vars <- getVarianceExplained(sce,  variables = c(
+        "sum",
+        "detected",
+        "Sample",
+        "Sex",
+        "Genotype",
+        "No_of_Genes",
+        "Exon_Reads",
+        "subsets_mito_percent"
+    ))
+
+plotExplanatoryVariables(vars)
+
+rm(vars)
+```
+
+-   Identify the inflection point i.e. elbow on scree plot using the "explained" variances:
+
+```{r}
+#| label: scree-plot2
+chosen_elbow <- findElbowPoint(pca_pct_variance$variance)
+
+pca_pct_variance %>% 
+  ggplot(aes(PC, variance)) +
+  geom_point() +
+  geom_vline(xintercept = chosen_elbow)+
+  geom_text(x = chosen_elbow, label = paste(chosen_elbow, "PCs before elbow"), y = 5, colour = "blue", angle = 90, vjust = 1.5)
+
+rm(chosen_elbow)
+```
+
+## Denoise PCA
+
+-   Using the gene variance calculated on line `710` run a "denoise" on the PCA to remove all PCs that are believed to capture more technical noise than real variation. ++ Output will be the number of PCs thought to be sufficient to capture most of the variation, type `?denoisePCA` in the console for full description. ++ Should be a similar output value to the chosen PC number above.
+
+```{r}
+#| label: denoise
+sce <- denoisePCA(sce,  technical = gene_var)
+
+ncol(reducedDim(sce, "PCA"))
+```
+
+## t-SNE
+
+-   [t-Distributed Stochastic Neighbor Embedding (t-SNE)](https://www.youtube.com/watch?v=NEaUSP4YerM)
+    -   Data is scaled and exaggerated in t-SNE and UMAP, and therefore not suitable for downstream analysis, **only for visualisation**!
+    -   Seed setting ensures cluster reproducibility if re-run, this is a random number
+    -   Within-cluster distances are preserved but distance between cluster positions are often not meaningful
+        -   [Guide to t-SNE intepretation](https://distill.pub/2016/misread-tsne/)
+    -   Can observe read types or expression of cell-type specific genes overlaid on these t-SNE clusters, remember the scaling means DEGs **cannot** be inferred from dimension reducing methods.
+
+```{r}
+#| label: t-SNE
+set.seed(123) 
+
+sce <- scater::runTSNE(sce,
+                       name = "TSNE_perplex10",
+                       perplexity = 10,
+                       dimred = "PCA")
+# To Visualise 
+
+ggcells(sce, aes(x = TSNE_perplex10.1, y = TSNE_perplex10.2, colour = Genotype)) + 
+      geom_point() +
+      theme_minimal() +
+      theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(),  
+        axis.ticks.y=element_blank()) +
+      coord_fixed()
+
+# Investigate specific attributes or genes
+ggcells(sce, aes(x = TSNE_perplex10.1, y = TSNE_perplex10.2,
+                 colour = No_of_Genes))+
+  facet_wrap(~ Genotype) +
+  geom_point()+
+  scale_color_viridis_b()+
+   theme_minimal() +
+      theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(),  
+        axis.ticks.y=element_blank()) +
+      coord_fixed()
+
+ggcells(sce, aes(x = TSNE_perplex10.1, y = TSNE_perplex10.2,
+                 colour = Abi3))+
+  facet_wrap(~ Genotype) +
+  geom_point()+
+  scale_color_viridis_b()+
+   theme_minimal() +
+      theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(),  
+        axis.ticks.y=element_blank()) +
+      coord_fixed()
+```
+
+## UMAP
+
+-   [Uniform Manifold Approximation and projection (UMAP)](https://umap-learn.readthedocs.io/en/latest/)
+
+    -   Similar dimension reduction method, but faster and less intensive as it uses the PCs
+    -   Preserves better global structure i.e. between cluster comparisons more meaningful (slightly disputed, as can be over-interpreted).
+    -   May need to adjust the number of neighbors to get appropriate clustering, re-run as needed.
+
+```{r}
+#| label: UMAP
+set.seed(123) # set seed for reproducibility
+sce <- runUMAP(sce,
+               name = "UMAP_neighbors50",
+               dimred = "PCA",
+               n_neighbors = 50)
+
+# To Visualise 
+ggcells(sce, aes(x = UMAP_neighbors50.1, y= UMAP_neighbors50.2, colour = Genotype))+
+    facet_wrap(~ Sex) +
+  geom_point()+
+   theme_minimal() +
+      theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(),  
+        axis.ticks.y=element_blank()) +
+      coord_fixed()
+
+ggcells(sce, aes(x = UMAP_neighbors50.1, y= UMAP_neighbors50.2, colour = No_of_Genes))+
+  facet_wrap(~ Sex) +
+  geom_point()+
+  scale_color_viridis_b()+
+   theme_minimal() +
+      theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(),  
+        axis.ticks.y=element_blank()) +
+      coord_fixed()
+
+ggcells(sce, aes(x = UMAP_neighbors50.1, y= UMAP_neighbors50.2, colour = Cox8a))+
+  facet_wrap(~ Sex) +
+  geom_point()+
+  scale_color_viridis_b()+
+   theme_minimal() +
+      theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(),  
+        axis.ticks.y=element_blank()) +
+      coord_fixed()
+```
+
+-   The choice between t-SNE and UMAP plots is largely personal, either way the plots should display the **underlying biology**.
+
+##{-}
+
+```{r}
+#| label: RDS-DimRed
+saveRDS(sce, here("results/DimRed.rds"))
+saveRDS(gene_var, here("results/GeneVar.rds"))
+```
+
+## Gene expression inspection
+
+- NOTE: I commented a line out that relied on an object that isn't defined elsewhere
+
+```{r}
+# Check expression of Abi3 across samples
+# Make dataframe filtered to Abi3
+sce_filt <- sce[grepl("Abi3", rowData(sce)$Gene_Name),]
+
+
+# Get gene lenght of gene of interest 
+abi3_length <- rowData(sce_filt)$Gene_Length
+
+df_abi3 <- as.data.frame(assay(sce_filt)) %>%
+  rownames_to_column(var = "gene") %>%
+  pivot_longer(-gene, names_to = "cell", values_to = "count")
+
+
+## Add sample and control
+df_abi3 <- as.data.frame(colData(sce_filt)) %>%
+  rownames_to_column(var = "cell") %>%
+  dplyr::select(cell, Sample, sample_type) %>%
+  left_join(df_abi3)
+
+ggplot(df_abi3, aes(Sample, count, fill = sample_type)) + 
+  geom_violin() + 
+  ggtitle("Abi3 counts all") + 
+  theme(axis.text.x = element_text(angle = 90))
+
+
+# Calculate proportion of cell with 0 of your gene 
+df_abi3 %>%
+  group_by(Sample) %>%
+  summarise(cell_num = n(), num_0s = sum(count == 0),
+            count_0_proportion = (sum(count == 0) / n()) * 100,
+            less_than_6_prop = (sum(count < 6) / n()) *100,
+            less_than_11_prop = (sum(count < 11) / n()) *100,
+            less_than_21_prop = (sum(count < 21) / n()) *100,
+            more_than_50_prop = (sum(count > 50) / n()) *100) %>%
+  DT::datatable()
+
+
+## check genes with similar length to Abi3 - this gene has lenght = 4298. I chose genes with lengths from 3500 to 4500 - this was an arbitrary choice 
+sce_filt_length <- sce[rowData(sce)$Gene_Length > 3500 & rowData(sce)$Gene_Length < 4500,]
+
+sce_filt_length <- sce[rowData(sce)$Gene_Length > 4500,]
+
+# note: this line doesn't work as the `cells_to_exclude` object doesn't exist
+# sce_filt_length$Abi3 <- ifelse(rownames(colData(sce_filt_length)) %in% cells_to_exclude, "Abi3_present", "Abi3_absent")
+
+df_abi3 <- as.data.frame(assay(sce_filt_length)) %>%
+  rownames_to_column(var = "gene") %>%
+  pivot_longer(-gene, names_to = "cell", values_to = "count")
+
+## add sample and treatment
+df_abi3 <- as.data.frame(colData(sce_filt_length)) %>%
+  rownames_to_column(var = "cell") %>%
+  dplyr::select(cell, Sample, sample_type) %>%
+  left_join(df_abi3)
+ggplot(df_abi3, aes(Sample, count, fill = sample_type)) +
+  geom_violin() +
+  ggtitle("Counts for genes with similar length to PLCG2")
+```
